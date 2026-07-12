@@ -1,49 +1,25 @@
 /*
+Parser-backed programming tools.
 
-A single module that supports compiler-time tools to make programming easier:
-  -find_def <file>@<line>:<col>
-  -find_usages <file>@<line>:<col>
-  -rename <file>@<line>:<col> <new_name> [-y]
+Command-line API:
+  programming -find_def <file>@<line>:<col> [-dir <path>]
+  programming -find_usages <file>@<line>:<col> [-dir <path>]
+  programming -rename <file>@<line>:<col> <new_name> [-y] [-dir <path>]
 
-Integration into a build script:
-
-  #import "programming";
-
-  #run {
-      set_build_options_dc(.{do_output = false});
-
-      tool := programming_parse_args();
-      is_tool := tool != .NONE;
-
-      w := compiler_create_workspace("Target workspace");
-      options := get_build_options(w);
-      copy_commonly_propagated_fields(get_build_options(), *options);
-      if is_tool  options.output_type = .NO_OUTPUT;
-      set_build_options(options, w);
-
-      compiler_begin_intercept(w);
-      add_build_file("src/main.jai", w);
-      while true {
-          message := compiler_wait_for_message();
-          if message.kind == .ERROR  exit(1);
-          programming_handle_message(message);
-          if message.kind == .COMPLETE  break;
-      }
-      compiler_end_intercept(w);
-
-      programming_finish();
-  };
-
+This deliberately scans Jai source files under -dir instead of relying on the
+Jai compiler workspace. That means files culled from a normal compilation are
+still visible to find-usages and rename.
 */
 
-#import "Compiler";
+#import "Basic";
 #import "File";
 #import "File_Utilities";
 #import "String";
-#import "Sort";
-#import "Basic";
+#import "tbx/parser";
 
 #scope_module
+
+DEFAULT_JAI_MODULES_DIRECTORY :: "C:/Users/ccn/projects/jai/modules";
 
 Tool_Mode :: enum {
     NONE;
@@ -53,704 +29,706 @@ Tool_Mode :: enum {
 }
 
 Location_Request :: struct {
-    filename:  string;
-    line:      s32;
-    character: s32;
+    filename: string;
+    line: int;
+    column: int;
 }
 
-Buffered_Reference :: struct {
-    resolved_declaration: *Code_Declaration;
-    filename:   string;
-    line:       s32;
-    char_start: s32;
-    char_end:   s32;
-    name:       string;
+Program_Options :: struct {
+    mode: Tool_Mode;
+    request: Location_Request;
+    new_name: string;
+    apply: bool;
+    directory: string;
+    include_jai_modules: bool;
+    jai_modules_directory: string;
 }
 
-Buffered_Block :: struct {
-    block: *Code_Block;
+Programming_File :: struct {
+    path: string;
+    source: string;
+    root: *Node;
 }
 
-Rename_Edit :: struct {
-    filename:   string;
-    line:       s32;
-    char_start: s32;
-    char_end:   s32;
-    new_text:   string;
+Programming_Edit :: struct {
+    start: int;
+    count: int;
 }
 
-//  Module state
+path_char_equal :: (a: u8, b: u8) -> bool {
+    if a >= #char "A" && a <= #char "Z" a += #char "a" - #char "A";
+    if b >= #char "A" && b <= #char "Z" b += #char "a" - #char "A";
+    if a == b return true;
+    if (a == #char "/" || a == #char "\\") && (b == #char "/" || b == #char "\\") return true;
+    return false;
+}
 
-active_tool:        Tool_Mode;
-tool_request:       Location_Request;
-rename_new_name:    string;
-rename_auto_confirm: bool;
+path_equal :: (a: string, b: string) -> bool {
+    if a.count == b.count {
+        for i: 0..a.count-1 {
+            if !path_char_equal(a[i], b[i]) return false;
+        }
+        return true;
+    }
 
-all_references: [..] Buffered_Reference;
-all_blocks:     [..] Buffered_Block;
+    longer := a;
+    shorter := b;
+    if b.count > a.count {
+        longer = b;
+        shorter = a;
+    }
 
-//  Shared utilities
+    start := longer.count - shorter.count;
+    if start > 0 && !path_char_equal(longer[start - 1], #char "/") return false;
 
-get_node_filename :: (node: *Code_Node) -> string {
-    if node == null          return "";
-    if !node.enclosing_load  return "";
-    return node.enclosing_load.fully_pathed_filename;
+    for i: 0..shorter.count-1 {
+        if !path_char_equal(longer[start + i], shorter[i]) return false;
+    }
+
+    return true;
+}
+
+path_is_under_directory :: (path: string, directory: string) -> bool {
+    if path_equal(path, directory) return true;
+    if path.count <= directory.count return false;
+
+    for i: 0..directory.count-1 {
+        if !path_char_equal(path[i], directory[i]) return false;
+    }
+
+    return path_char_equal(path[directory.count], #char "/");
 }
 
 resolve_path :: (path: string, cwd: string) -> string {
-    if path.count == 0                               return path;
-    if path.count >= 2 && path[1] == #char ":"       return path;
-    if path[0] == #char "/"                          return path;
+    if path.count == 0 return path;
 
-    result := tprint("%/%", cwd, path);
-    for i: 0..result.count-1 {
-        if result[i] == #char "\\"  result[i] = #char "/";
+    raw := path;
+    if raw.count >= 2 && raw[0] == #char "." && (raw[1] == #char "/" || raw[1] == #char "\\") {
+        raw = slice(raw, 2, raw.count - 2);
     }
+
+    result: string;
+    if raw.count >= 3 && raw[0] == #char "/" && raw[2] == #char "/" &&
+       ((raw[1] >= #char "a" && raw[1] <= #char "z") || (raw[1] >= #char "A" && raw[1] <= #char "Z")) {
+        result = tprint("%", raw);
+        result[0] = raw[1];
+        if result[0] >= #char "a" && result[0] <= #char "z" result[0] -= #char "a" - #char "A";
+        result[1] = #char ":";
+    } else if raw.count >= 2 && raw[1] == #char ":" {
+        result = tprint("%", raw);
+    } else if raw[0] == #char "/" || raw[0] == #char "\\" {
+        result = tprint("%", raw);
+    } else {
+        result = tprint("%/%", cwd, raw);
+    }
+
+    for i: 0..result.count-1 {
+        if result[i] == #char "\\" result[i] = #char "/";
+    }
+
+    cleaned: String_Builder;
+    i := 0;
+    while i < result.count {
+        if result[i] == #char "/" && i + 2 < result.count && result[i + 1] == #char "." && result[i + 2] == #char "/" {
+            append(*cleaned, "/");
+            i += 3;
+            continue;
+        }
+
+        append(*cleaned, result[i]);
+        i += 1;
+    }
+
+    result = builder_to_string(*cleaned);
     return result;
 }
 
-find_last :: (s: string, c: u8) -> s64 {
+find_last :: (s: string, c: u8) -> int {
     i := s.count - 1;
     while i >= 0 {
-        if s[i] == c  return i;
+        if s[i] == c return i;
         i -= 1;
     }
     return -1;
 }
 
-find_first :: (s: string, c: u8) -> s64 {
+find_first :: (s: string, c: u8) -> int {
     for i: 0..s.count-1 {
-        if s[i] == c  return i;
+        if s[i] == c return i;
     }
     return -1;
 }
 
-parse_location :: (arg: string, cwd: string) -> (ok: bool, filename: string, line: s32, col: s32) {
+parse_positive_int :: (text: string) -> (value: int, ok: bool) {
+    if text.count == 0 return 0, false;
+
+    result := 0;
+    for c: text {
+        if c < #char "0" || c > #char "9" return 0, false;
+        result = result * 10 + cast(int)(c - #char "0");
+    }
+
+    return result, true;
+}
+
+parse_location :: (arg: string, cwd: string) -> (ok: bool, filename: string, line: int, column: int) {
     at_index := find_last(arg, #char "@");
-    if at_index < 1  return false, "", 0, 0;
+    if at_index < 1 return false, "", 0, 0;
 
     filename_part := slice(arg, 0, at_index);
     rest := slice(arg, at_index + 1, arg.count - at_index - 1);
 
     colon_index := find_first(rest, #char ":");
-    if colon_index < 1  return false, "", 0, 0;
+    if colon_index < 1 return false, "", 0, 0;
 
     line_str := slice(rest, 0, colon_index);
-    col_str  := slice(rest, colon_index + 1, rest.count - colon_index - 1);
+    col_str := slice(rest, colon_index + 1, rest.count - colon_index - 1);
 
-    ok: bool;
-    line_val: s64;
-    col_val:  s64;
+    line_val, line_ok := parse_positive_int(line_str);
+    if !line_ok return false, "", 0, 0;
 
-    line_val, ok = string_to_int(line_str);
-    if !ok  return false, "", 0, 0;
+    col_val, col_ok := parse_positive_int(col_str);
+    if !col_ok return false, "", 0, 0;
 
-    col_val, ok = string_to_int(col_str);
-    if !ok  return false, "", 0, 0;
-
-    return true, resolve_path(filename_part, cwd), cast(s32) line_val, cast(s32) col_val;
+    return true, resolve_path(filename_part, cwd), line_val, col_val;
 }
 
-filename_match :: (a: string, b: string) -> bool {
-    if a.count == 0 || b.count == 0  return false;
-    return a == b || ends_with(a, b) || ends_with(b, a);
+is_identifier_start :: (c: u8) -> bool {
+    return (c >= #char "a" && c <= #char "z") ||
+           (c >= #char "A" && c <= #char "Z") ||
+           c == #char "_";
 }
 
-//  Node buffering 
+is_identifier_continue :: (c: u8) -> bool {
+    return is_identifier_start(c) || (c >= #char "0" && c <= #char "9");
+}
 
-buffer_node :: (refs: *[..] Buffered_Reference, node: *Code_Node) {
-    if node == null  return;
+is_valid_identifier :: (name: string) -> bool {
+    if name.count == 0 return false;
+    if !is_identifier_start(name[0]) return false;
 
-    if node.kind == {
-        case .IDENT;
-            ident := cast(*Code_Ident) node;
-            if ident.resolved_declaration == null  return;
-            if ident.name.count == 0               return;
-
-            ref: Buffered_Reference;
-            ref.resolved_declaration = ident.resolved_declaration;
-            ref.filename   = get_node_filename(node);
-            ref.line       = node.l0;
-            ref.char_start = node.c0;
-            ref.char_end   = node.c0 + cast(s32) ident.name.count;
-            ref.name       = ident.name;
-            array_add(refs, ref);
-
-        case .DECLARATION;
-            decl := cast(*Code_Declaration) node;
-            if decl.name.count == 0  return;
-
-            ref: Buffered_Reference;
-            ref.resolved_declaration = decl;
-            ref.filename   = get_node_filename(node);
-            ref.line       = node.l0;
-            ref.char_start = node.c0;
-            ref.char_end   = node.c0 + cast(s32) decl.name.count;
-            ref.name       = decl.name;
-            array_add(refs, ref);
-
-            if decl.type_inst    buffer_node(refs, decl.type_inst);
-            if decl.expression   buffer_node(refs, decl.expression);
-
-        case .TYPE_INSTANTIATION;
-            ti := cast(*Code_Type_Instantiation) node;
-            if ti.type_valued_expression  buffer_node(refs, ti.type_valued_expression);
-            if ti.pointer_to              buffer_node(refs, ti.pointer_to);
-            if ti.array_element_type      buffer_node(refs, ti.array_element_type);
-            if ti.type_directive_target    buffer_node(refs, ti.type_directive_target);
-
-        case .BINARY_OPERATOR;
-            bin := cast(*Code_Binary_Operator) node;
-            if bin.left   buffer_node(refs, bin.left);
-            if bin.right  buffer_node(refs, bin.right);
-
-        case .UNARY_OPERATOR;
-            un := cast(*Code_Unary_Operator) node;
-            if un.subexpression  buffer_node(refs, un.subexpression);
-
-        case .PROCEDURE_CALL;
-            call := cast(*Code_Procedure_Call) node;
-            if call.procedure_expression  buffer_node(refs, call.procedure_expression);
-            for call.arguments_sorted     buffer_node(refs, it);
-
-        case .IF;
-            ifc := cast(*Code_If) node;
-            if ifc.condition  buffer_node(refs, ifc.condition);
-
-        case .WHILE;
-            wh := cast(*Code_While) node;
-            if wh.condition  buffer_node(refs, wh.condition);
-
-        case .FOR;
-            fc := cast(*Code_For) node;
-            if fc.iteration_expression        buffer_node(refs, fc.iteration_expression);
-            if fc.iteration_expression_right  buffer_node(refs, fc.iteration_expression_right);
-            if fc.ident_decl  buffer_node(refs, cast(*Code_Node) fc.ident_decl);
-            if fc.index_decl  buffer_node(refs, cast(*Code_Node) fc.index_decl);
-
-        case .RETURN;
-            ret := cast(*Code_Return) node;
-            for ret.arguments_sorted  buffer_node(refs, it);
-
-        case .CAST;
-            c := cast(*Code_Cast) node;
-            if c.target_type  buffer_node(refs, c.target_type);
-            if c.expression   buffer_node(refs, c.expression);
+    i := 1;
+    while i < name.count {
+        if !is_identifier_continue(name[i]) return false;
+        i += 1;
     }
+
+    return true;
 }
 
-//  Block buffering (needed for rename collision detection)
+collect_jai_files :: (dir: string) -> [] string {
+    results: [..] string;
 
-buffer_block :: (blks: *[..] Buffered_Block, block: *Code_Block) {
-    if block == null  return;
-    for blks.*  { if it.block == block  return; }
-    array_add(blks, .{block});
-}
-
-buffer_block_recursive :: (blks: *[..] Buffered_Block, block: *Code_Block) {
-    if block == null  return;
-    buffer_block(blks, block);
-    for block.statements {
-        if it == null  continue;
-        if it.kind == {
-            case .IF;
-                ifc := cast(*Code_If) it;
-                if ifc.then_block  buffer_block_recursive(blks, ifc.then_block);
-                if ifc.else_block  buffer_block_recursive(blks, ifc.else_block);
-            case .WHILE;
-                wh := cast(*Code_While) it;
-                if wh.block  buffer_block_recursive(blks, wh.block);
-            case .FOR;
-                fc := cast(*Code_For) it;
-                if fc.block  buffer_block_recursive(blks, fc.block);
-                if fc.macro_expansion_procedure_call {
-                    mc := fc.macro_expansion_procedure_call;
-                    if mc.macro_expansion_block  buffer_block_recursive(blks, mc.macro_expansion_block);
-                }
-            case .BLOCK;
-                buffer_block_recursive(blks, cast(*Code_Block) it);
-            case .PUSH_CONTEXT;
-                pc := cast(*Code_Push_Context) it;
-                if pc.block  buffer_block_recursive(blks, pc.block);
-            case .DEFER;
-                df := cast(*Code_Defer) it;
-                if df.block  buffer_block_recursive(blks, df.block);
+    visitor :: (info: *File_Visit_Info, results: *[..] string) {
+        if info.is_directory {
+            if info.short_name == ".build" || info.short_name == ".git" {
+                info.descend_into_directory = false;
+            }
+            return;
         }
-    }
+
+        name := info.short_name;
+        if name.count < 4 return;
+
+        ext: string;
+        ext.data = name.data + name.count - 4;
+        ext.count = 4;
+        if ext == ".jai" array_add(results, copy_string(info.full_name));
+    };
+
+    visit_files(dir, recursive = true, *results, visitor, visit_directories = true);
+    return results;
 }
 
-buffer_statements_recursive :: (refs: *[..] Buffered_Reference, block: *Code_Block) {
-    if block == null  return;
-
-    for block.members  buffer_node(refs, it);
-    for block.statements {
-        if it == null  continue;
-        buffer_node(refs, it);
-
-        if it.kind == {
-            case .IF;
-                ifc := cast(*Code_If) it;
-                if ifc.then_block  buffer_statements_recursive(refs, ifc.then_block);
-                if ifc.else_block  buffer_statements_recursive(refs, ifc.else_block);
-            case .WHILE;
-                wh := cast(*Code_While) it;
-                if wh.block  buffer_statements_recursive(refs, wh.block);
-            case .FOR;
-                fc := cast(*Code_For) it;
-                if fc.block  buffer_statements_recursive(refs, fc.block);
-                if fc.macro_expansion_procedure_call {
-                    mc := fc.macro_expansion_procedure_call;
-                    if mc.macro_expansion_block  buffer_statements_recursive(refs, mc.macro_expansion_block);
-                    for mc.arguments_sorted  buffer_node(refs, it);
-                }
-            case .BLOCK;
-                buffer_statements_recursive(refs, cast(*Code_Block) it);
-            case .PUSH_CONTEXT;
-                pc := cast(*Code_Push_Context) it;
-                if pc.block  buffer_statements_recursive(refs, pc.block);
-            case .DEFER;
-                df := cast(*Code_Defer) it;
-                if df.block  buffer_statements_recursive(refs, df.block);
-        }
+add_unique_path :: (paths: *[..] string, path: string) {
+    for existing: paths.* {
+        if path_equal(existing, path) return;
     }
+
+    array_add(paths, copy_string(path));
 }
 
-//  Shared resolution helpers
+load_project :: (options: Program_Options) -> ([..] Programming_File, [..] Resolver_Input_File, bool) {
+    files: [..] Programming_File;
+    inputs: [..] Resolver_Input_File;
+    ok := true;
 
-resolve_target :: (request: Location_Request, refs: [] Buffered_Reference) -> (decl: *Code_Declaration, name: string) {
-    for refs {
-        if it.filename.count == 0                        continue;
-        if !filename_match(it.filename, request.filename) continue;
-        if it.line != request.line                       continue;
-        if request.character < it.char_start             continue;
-        if request.character >= it.char_end              continue;
+    cwd := get_working_directory();
+    roots: [..] string;
+    array_add(*roots, options.directory);
+    if options.include_jai_modules array_add(*roots, options.jai_modules_directory);
 
-        return it.resolved_declaration, it.name;
-    }
-    return null, "";
-}
-
-report_no_symbol :: (request: Location_Request, refs: [] Buffered_Reference) {
-    has_any_from_file := false;
-    for refs {
-        if it.filename.count == 0  continue;
-        if filename_match(it.filename, request.filename) {
-            has_any_from_file = true;
-            break;
+    paths: [..] string;
+    for root: roots {
+        scan_directory := resolve_path(root, cwd);
+        raw_paths := collect_jai_files(scan_directory);
+        for raw_path: raw_paths {
+            add_unique_path(*paths, resolve_path(raw_path, cwd));
         }
     }
 
-    if !has_any_from_file {
-        log_error("No references found from file '%'.\nThat file must be part of the target workspace (i.e. included in the code being built via #load, #import, or add_build_file).", request.filename);
-    } else {
-        log_error("No symbol found at %:%:%", request.filename, request.line, request.character);
+    for path: paths {
+        source, read_ok := read_entire_file(path);
+        if !read_ok {
+            log_error("Could not read '%'", path);
+            ok = false;
+            continue;
+        }
+
+        parse_result := parse(source);
+        if !parse_result.success {
+            log_error("Parser failed for '%' at %:%: %", path, parse_result.error.span.line, parse_result.error.span.column, parse_result.error.message);
+            ok = false;
+            continue;
+        }
+
+        file: Programming_File;
+        file.path = path;
+        file.source = source;
+        file.root = parse_result.root;
+        array_add(*files, file);
+
+        input: Resolver_Input_File;
+        input.path = path;
+        input.root = parse_result.root;
+        array_add(*inputs, input);
     }
+
+    return files, inputs, ok;
 }
 
-find_parent_block :: (blks: [] Buffered_Block, decl: *Code_Declaration) -> *Code_Block {
-    for bb: blks {
-        for bb.block.members {
-            if cast(*Code_Node) it == cast(*Code_Node) decl  return bb.block;
-        }
+find_project_file :: (files: [] Programming_File, path: string) -> *Programming_File {
+    for * file: files {
+        if path_equal(file.path, path) return file;
     }
     return null;
 }
 
-collect_matching_refs :: (target: *Code_Declaration, refs: [] Buffered_Reference) -> ([..] Buffered_Reference, s32) {
-    matching: [..] Buffered_Reference;
-    total: s32 = 0;
+append_source_slice :: (builder: *String_Builder, source: string, start: int, count: int) {
+    if count <= 0 return;
 
-    for ref: refs {
-        if ref.resolved_declaration != target  continue;
+    slice_text: string;
+    slice_text.data = source.data + start;
+    slice_text.count = count;
+    append(builder, slice_text);
+}
 
-        already := false;
-        for m: matching {
-            if m.filename == ref.filename && m.line == ref.line && m.char_start == ref.char_start {
-                already = true;
-                break;
-            }
+apply_edits :: (source: string, edits: [] Programming_Edit, new_name: string) -> string {
+    sorted: [..] Programming_Edit;
+    array_add(*sorted, ..edits);
+
+    for i: 1..sorted.count-1 {
+        edit := sorted[i];
+        j := i - 1;
+        while j >= 0 && sorted[j].start > edit.start {
+            sorted[j + 1] = sorted[j];
+            j -= 1;
         }
-        if already  continue;
-
-        total += 1;
-        array_add(*matching, ref);
+        sorted[j + 1] = edit;
     }
 
-    return matching, total;
-}
+    result: String_Builder;
+    cursor := 0;
 
-File_Count :: struct {
-    filename: string;
-    count:    s32;
-}
-
-collect_file_counts :: (matching: [] Buffered_Reference) -> [..] File_Count {
-    file_counts: [..] File_Count;
-    for ref: matching {
-        found := false;
-        for *fc: file_counts {
-            if fc.filename == ref.filename { fc.count += 1; found = true; break; }
-        }
-        if !found  array_add(*file_counts, File_Count.{ref.filename, 1});
+    for edit: sorted {
+        append_source_slice(*result, source, cursor, edit.start - cursor);
+        append(*result, new_name);
+        cursor = edit.start + edit.count;
     }
-    return file_counts;
+
+    append_source_slice(*result, source, cursor, source.count - cursor);
+    return builder_to_string(*result);
 }
 
-display_refs_by_file :: (matching: [] Buffered_Reference, file_counts: [] File_Count) {
-    for fc: file_counts {
-        log("  %  (% occurrences):", fc.filename, fc.count);
+line_at_span :: (source: string, span: Source_Span) -> string {
+    lines := split(source, cast(u8) #char "\n");
+    index := span.line - 1;
+    if index < 0 || index >= lines.count return "";
+    return trim_right(lines[index]);
+}
 
-        contents, success := read_entire_file(fc.filename);
-        lines: [] string;
-        if success  lines = split(contents, "\n");
+add_unique_edit :: (edits: *[..] Programming_Edit, edit: Programming_Edit) {
+    for existing: edits.* {
+        if existing.start == edit.start && existing.count == edit.count return;
+    }
+    array_add(edits, edit);
+}
 
-        lines_shown: [..] s32;
+collect_edits_for_file :: (resolver: Resolver_Result, symbol: *Resolver_Symbol, file_path: string) -> [..] Programming_Edit {
+    edits: [..] Programming_Edit;
 
-        for ref: matching {
-            if ref.filename != fc.filename  continue;
+    if symbol != null && path_equal(symbol.file_path, file_path) && symbol.declaration_node != null {
+        add_unique_edit(*edits, .{ start = symbol.declaration_node.span.start_position_in_input, count = symbol.declaration_node.span.count });
+    }
 
-            already_shown := false;
-            for ls: lines_shown  if ls == ref.line { already_shown = true; break; }
-            if already_shown  continue;
-            array_add(*lines_shown, ref.line);
+    for reference: resolver.references {
+        if reference.symbol != symbol continue;
+        if !path_equal(reference.file_path, file_path) continue;
+        if reference.node == null continue;
+        add_unique_edit(*edits, .{ start = reference.node.span.start_position_in_input, count = reference.node.span.count });
+    }
 
-            line_idx := ref.line - 1;
-            if !success || line_idx < 0 || line_idx >= lines.count {
-                log("    %: (could not read line)", ref.line);
-                continue;
-            }
+    return edits;
+}
 
-            log("    %: %", ref.line, lines[line_idx]);
+reference_count_for_symbol_in_file :: (resolver: Resolver_Result, symbol: *Resolver_Symbol, file_path: string) -> int {
+    edits := collect_edits_for_file(resolver, symbol, file_path);
+    return edits.count;
+}
+
+print_usages :: (files: [] Programming_File, resolver: Resolver_Result, symbol: *Resolver_Symbol) {
+    total := 0;
+    for file: files total += reference_count_for_symbol_in_file(resolver, symbol, file.path);
+
+    log("Usages of '%'", symbol.name);
+    log(" ");
+    log("  Declared at: %@%:%", symbol.file_path, symbol.declaration_node.span.line, symbol.declaration_node.span.column);
+    log("  Total usages: %", total);
+    log(" ");
+
+    for file: files {
+        count := reference_count_for_symbol_in_file(resolver, symbol, file.path);
+        if count == 0 continue;
+
+        log("  %  (% occurrences):", file.path, count);
+
+        if symbol.file_path == file.path {
+            log("    %: %", symbol.declaration_node.span.line, line_at_span(file.source, symbol.declaration_node.span));
+        }
+
+        shown: [..] int;
+        for reference: resolver.references {
+            if reference.symbol != symbol continue;
+            if !path_equal(reference.file_path, file.path) continue;
+
+            already := false;
+            for line: shown if line == reference.node.span.line { already = true; break; }
+            if already continue;
+            array_add(*shown, reference.node.span.line);
+
+            log("    %: %", reference.node.span.line, line_at_span(file.source, reference.node.span));
         }
 
         log(" ");
     }
 }
 
-//  Tool-specific finish logic
-
-finish_find_def :: () {
-    target, name := resolve_target(tool_request, all_references);
-    if target == null {
-        report_no_symbol(tool_request, all_references);
-        return;
+scope_is_or_descends_from :: (scope: *Resolver_Scope, ancestor: *Resolver_Scope) -> bool {
+    current := scope;
+    while current != null {
+        if current == ancestor return true;
+        current = current.parent;
     }
-
-    decl_file := get_node_filename(cast(*Code_Node) target);
-    log("%@%:%", decl_file, target.l0, target.c0);
+    return false;
 }
 
-finish_find_usages :: () {
-    target, old_name := resolve_target(tool_request, all_references);
-    if target == null {
-        report_no_symbol(tool_request, all_references);
-        return;
+log_rename_warning_header :: (warnings: *int) {
+    if warnings.* == 0 {
+        log("Rename Warnings");
+        log(" ");
     }
-
-    matching, total := collect_matching_refs(target, all_references);
-    file_counts := collect_file_counts(matching);
-
-    decl_file := get_node_filename(cast(*Code_Node) target);
-
-    log("Usages of '%'", old_name);
-    log(" ");
-    log("  Declared at: %:%:%", decl_file, target.l0, target.c0);
-    log("  Total usages: %", total);
-    log(" ");
-
-    display_refs_by_file(matching, file_counts);
+    warnings.* += 1;
 }
 
-finish_rename :: () {
-    request := tool_request;
-
-    log("Collected % references, % blocks", all_references.count, all_blocks.count);
-
-    target, old_name := resolve_target(request, all_references);
-    if target == null {
-        report_no_symbol(request, all_references);
+log_symbol_location :: (prefix: string, symbol: *Resolver_Symbol) {
+    if symbol == null || symbol.declaration_node == null {
+        log("  % <unknown>", prefix);
         return;
     }
 
-    // collision check
-    target_block := find_parent_block(all_blocks, target);
-    if target_block != null {
-        for all_references {
-            if it.resolved_declaration == target   continue;
-            if it.name != rename_new_name          continue;
-            other_decl := it.resolved_declaration;
-            if other_decl == null  continue;
-            other_block := find_parent_block(all_blocks, other_decl);
-            if other_block == target_block {
-                decl_file := get_node_filename(cast(*Code_Node) other_decl);
-                log_error("Rename would collide with existing symbol '%' declared at %:%:%",
-                    rename_new_name, decl_file, other_decl.l0, other_decl.c0);
-                return;
-            }
+    log("  % %@%:%", prefix, symbol.file_path, symbol.declaration_node.span.line, symbol.declaration_node.span.column);
+}
+
+check_rename_conflicts :: (resolver: Resolver_Result, symbol: *Resolver_Symbol, new_name: string) -> int {
+    if symbol == null || new_name == symbol.name return 0;
+
+    warnings := 0;
+
+    same_scope_symbol := find_symbol_in_scope(symbol.scope, new_name);
+    if same_scope_symbol != null && same_scope_symbol != symbol {
+        log_rename_warning_header(*warnings);
+        log("  New name '%' already exists in the declaration scope.", new_name);
+        log_symbol_location("Existing declaration:", same_scope_symbol);
+        log(" ");
+    }
+
+    if symbol.scope != null {
+        visible_symbol := find_symbol(symbol.scope.parent, new_name);
+        if visible_symbol != null && visible_symbol != symbol {
+            log_rename_warning_header(*warnings);
+            log("  New name '%' would shadow an outer declaration.", new_name);
+            log_symbol_location("Shadowed declaration:", visible_symbol);
+            log(" ");
         }
     }
 
-    matching, total := collect_matching_refs(target, all_references);
-    file_counts := collect_file_counts(matching);
+    for reference: resolver.references {
+        if reference.node == null || reference.scope == null continue;
 
-    decl_file := get_node_filename(cast(*Code_Node) target);
+        if reference.symbol == symbol {
+            visible_symbol := find_symbol(reference.scope, new_name);
+            if visible_symbol != null && visible_symbol != symbol {
+                log_rename_warning_header(*warnings);
+                log("  Renamed usage at %@%:% would collide with another visible declaration named '%'.",
+                    reference.file_path, reference.node.span.line, reference.node.span.column, new_name);
+                log_symbol_location("Visible declaration:", visible_symbol);
+                log(" ");
+            }
+            continue;
+        }
+
+        if reference.name != new_name continue;
+        if !scope_is_or_descends_from(reference.scope, symbol.scope) continue;
+
+        if reference.scope == symbol.scope && symbol.declaration_node != null &&
+           reference.node.span.start_position_in_input < symbol.declaration_node.span.start_position_in_input {
+            continue;
+        }
+
+        log_rename_warning_header(*warnings);
+        log("  Existing reference at %@%:% may be captured by the renamed symbol.",
+            reference.file_path, reference.node.span.line, reference.node.span.column);
+        if reference.symbol != null log_symbol_location("Currently resolves to:", reference.symbol);
+        log(" ");
+    }
+
+    return warnings;
+}
+
+find_symbol_for_request :: (resolver: Resolver_Result, request: Location_Request) -> *Resolver_Symbol {
+    return find_symbol_at_position_in_file(resolver, request.filename, request.line, request.column);
+}
+
+run_find_def :: (files: [] Programming_File, resolver: Resolver_Result, options: Program_Options) -> bool {
+    symbol := find_symbol_for_request(resolver, options.request);
+    if symbol == null {
+        log_error("No symbol found at %@%:%", options.request.filename, options.request.line, options.request.column);
+        return false;
+    }
+
+    log("%@%:%", symbol.file_path, symbol.declaration_node.span.line, symbol.declaration_node.span.column);
+    return true;
+}
+
+run_find_usages :: (files: [] Programming_File, resolver: Resolver_Result, options: Program_Options) -> bool {
+    symbol := find_symbol_for_request(resolver, options.request);
+    if symbol == null {
+        log_error("No symbol found at %@%:%", options.request.filename, options.request.line, options.request.column);
+        return false;
+    }
+
+    print_usages(files, resolver, symbol);
+    return true;
+}
+
+run_rename :: (files: [] Programming_File, resolver: Resolver_Result, options: Program_Options) -> bool {
+    if !is_valid_identifier(options.new_name) {
+        log_error("New name '%' is not a valid simple Jai identifier.", options.new_name);
+        return false;
+    }
+
+    symbol := find_symbol_for_request(resolver, options.request);
+    if symbol == null {
+        log_error("No symbol found at %@%:%", options.request.filename, options.request.line, options.request.column);
+        return false;
+    }
+
+    if options.include_jai_modules {
+        modules_directory := resolve_path(options.jai_modules_directory, get_working_directory());
+        if path_is_under_directory(symbol.file_path, modules_directory) {
+            log("Rename refused");
+            log(" ");
+            log("  Symbol:      '%'", symbol.name);
+            log("  Declared at: %@%:%", symbol.file_path, symbol.declaration_node.span.line, symbol.declaration_node.span.column);
+            log(" ");
+            log("This symbol is defined inside the ambient Jai modules directory:");
+            log("  %", modules_directory);
+            log(" ");
+            log("Renaming Jai module symbols is blocked because it could affect every project that uses those modules.");
+            return false;
+        }
+    }
 
     log("Rename Preview");
     log(" ");
-    log("  Symbol:      '%'", old_name);
-    log("  New name:    '%'", rename_new_name);
-    log("  Declared at: %:%:%", decl_file, target.l0, target.c0);
-    log(" ");
-    log("  Total occurrences: %", total);
+    log("  Symbol:      '%'", symbol.name);
+    log("  New name:    '%'", options.new_name);
+    log("  Declared at: %@%:%", symbol.file_path, symbol.declaration_node.span.line, symbol.declaration_node.span.column);
     log(" ");
 
-    display_refs_by_file(matching, file_counts);
+    print_usages(files, resolver, symbol);
+    warnings := check_rename_conflicts(resolver, symbol, options.new_name);
 
-    if !rename_auto_confirm {
+    if !options.apply {
+        if warnings > 0 {
+            log("This rename has % warning(s). It will not be applied with -y until the conflicts are resolved.", warnings);
+            return true;
+        }
         log("This is a preview. Add -y to apply the rename.");
-        return;
+        return true;
     }
 
-    // build edits
-    collected_edits: [..] Rename_Edit;
+    if warnings > 0 {
+        log("Rename not applied because % warning(s) were found.", warnings);
+        return false;
+    }
 
-    for all_references {
-        if it.resolved_declaration != target  continue;
+    total_edits := 0;
+    for file: files {
+        edits := collect_edits_for_file(resolver, symbol, file.path);
+        if edits.count == 0 continue;
 
-        edit: Rename_Edit;
-        edit.filename   = it.filename;
-        edit.line       = it.line;
-        edit.char_start = it.char_start;
-        edit.char_end   = it.char_end;
-        edit.new_text   = rename_new_name;
-
-        already := false;
-        for collected_edits {
-            if it.filename == edit.filename && it.line == edit.line && it.char_start == edit.char_start {
-                already = true; break;
-            }
+        renamed := apply_edits(file.source, edits, options.new_name);
+        if !write_entire_file(file.path, renamed) {
+            log_error("Could not write '%'", file.path);
+            return false;
         }
-        if !already  array_add(*collected_edits, edit);
+
+        total_edits += edits.count;
+        log("  Renamed % occurrences in '%'", edits.count, file.path);
     }
 
     log(" ");
-    log("Applying % edits...", collected_edits.count);
-
-    if collected_edits.count == 0 { log("Nothing to rename."); return; }
-
-    quick_sort(collected_edits, (a: Rename_Edit, b: Rename_Edit) -> s64 {
-        if a.line != b.line  return cast(s64)(b.line - a.line);
-        return cast(s64)(b.char_start - a.char_start);
-    });
-
-    files_done: [..] string;
-
-    for edit: collected_edits {
-        already_done := false;
-        for files_done  if it == edit.filename { already_done = true; break; }
-        if already_done  continue;
-
-        array_add(*files_done, edit.filename);
-
-        contents, success := read_entire_file(edit.filename);
-        if !success { log_error("Could not read '%'", edit.filename); continue; }
-
-        lines := split(contents, "\n");
-        count := 0;
-
-        for e: collected_edits {
-            if e.filename != edit.filename  continue;
-            line_idx := e.line - 1;
-            if line_idx < 0 || line_idx >= lines.count  continue;
-
-            line := lines[line_idx];
-            col_start := e.char_start - 1;
-            col_end   := e.char_end - 1;
-            if col_start < 0 || col_end > line.count  continue;
-
-            new_line := join(
-                slice(line, 0, col_start),
-                e.new_text,
-                slice(line, col_end, line.count - col_end)
-            );
-            lines[line_idx] = new_line;
-            count += 1;
-        }
-
-        new_contents := join(..lines, separator = "\n");
-        write_entire_file(edit.filename, new_contents);
-        log("  Renamed % occurrences in '%'", count, edit.filename);
-    }
-
-    log(" ");
-    log("Done.");
+    log("Done. Applied % edits.", total_edits);
+    return true;
 }
 
-//  public api
+print_usage :: () {
+    log("programming - parser-backed Jai programming tools");
+    log(" ");
+    log("Usage:");
+    log("  programming -find_def <file>@<line>:<col> [-dir <path>]");
+    log("  programming -find_usages <file>@<line>:<col> [-dir <path>]");
+    log("  programming -rename <file>@<line>:<col> <new_name> [-y] [-dir <path>]");
+    log(" ");
+    log("Options:");
+    log("  -jai_modules <path>  Override the ambient Jai modules directory.");
+    log("  -no_jai_modules      Only scan the project directory.");
+}
 
 #scope_export
 
-programming_parse_args :: () -> Tool_Mode {
-    args := get_build_options().compile_time_command_line;
-    cwd  := get_working_directory();
+programming_parse_args :: (args: [] string, cwd: string) -> (Program_Options, bool) {
+    options: Program_Options;
+    options.directory = cwd;
+    options.include_jai_modules = true;
+    options.jai_modules_directory = DEFAULT_JAI_MODULES_DIRECTORY;
 
-    i := 0;
+    i := 1;
     while i < args.count {
-        if args[i] == "-find_def" {
+        arg := args[i];
+
+        if arg == "-help" || arg == "--help" || arg == "-h" {
+            print_usage();
+            return options, false;
+        } else if arg == "-dir" {
             i += 1;
-            if i < args.count {
-                ok, filename, line, col := parse_location(args[i], cwd);
-                if ok {
-                    tool_request.filename  = filename;
-                    tool_request.line      = line;
-                    tool_request.character = col;
-                    i += 1;
-                }
+            if i >= args.count {
+                log_error("-dir requires a path.");
+                return options, false;
             }
-
-            if tool_request.filename.count > 0
-            && tool_request.line > 0
-            && tool_request.character > 0 {
-                active_tool = .FIND_DEF;
-                return .FIND_DEF;
-            }
-
-            log_error("Incomplete arguments. Usage: -find_def <file>@<line>:<col>");
-            return .NONE;
-        }
-
-        if args[i] == "-find_usages" {
+            options.directory = resolve_path(args[i], cwd);
+        } else if arg == "-jai_modules" {
             i += 1;
-            if i < args.count {
-                ok, filename, line, col := parse_location(args[i], cwd);
-                if ok {
-                    tool_request.filename  = filename;
-                    tool_request.line      = line;
-                    tool_request.character = col;
-                    i += 1;
-                }
+            if i >= args.count {
+                log_error("-jai_modules requires a path.");
+                return options, false;
             }
-
-            if tool_request.filename.count > 0
-            && tool_request.line > 0
-            && tool_request.character > 0 {
-                active_tool = .FIND_USAGES;
-                log("Find usages: '%' at %:%:%",
-                    tool_request.filename,
-                    tool_request.filename,
-                    tool_request.line,
-                    tool_request.character);
-                return .FIND_USAGES;
-            }
-
-            log_error("Incomplete arguments. Usage: -find_usages <file>@<line>:<col>");
-            return .NONE;
-        }
-
-        if args[i] == "-rename" {
+            options.include_jai_modules = true;
+            options.jai_modules_directory = resolve_path(args[i], cwd);
+        } else if arg == "-no_jai_modules" {
+            options.include_jai_modules = false;
+        } else if arg == "-find_def" {
             i += 1;
-            if i < args.count {
-                ok, filename, line, col := parse_location(args[i], cwd);
-                if ok {
-                    tool_request.filename  = filename;
-                    tool_request.line      = line;
-                    tool_request.character = col;
-                    i += 1;
-                }
+            if i >= args.count {
+                log_error("Incomplete arguments. Usage: -find_def <file>@<line>:<col>");
+                return options, false;
             }
 
-            if i < args.count && args[i][0] != #char "-" {
-                rename_new_name = args[i];
-                i += 1;
+            loc_ok, filename, line, col := parse_location(args[i], cwd);
+            if !loc_ok {
+                log_error("Invalid location. Usage: <file>@<line>:<col>");
+                return options, false;
             }
 
-            // scan remaining args for -y
-            while i < args.count {
-                if args[i] == "-y"  rename_auto_confirm = true;
-                i += 1;
+            options.mode = .FIND_DEF;
+            options.request = .{ filename = filename, line = line, column = col };
+        } else if arg == "-find_usages" {
+            i += 1;
+            if i >= args.count {
+                log_error("Incomplete arguments. Usage: -find_usages <file>@<line>:<col>");
+                return options, false;
             }
 
-            if tool_request.filename.count > 0
-            && tool_request.line > 0
-            && tool_request.character > 0
-            && rename_new_name.count > 0 {
-                active_tool = .RENAME;
-                log("Rename: '%' at %:%:% -> '%'",
-                    tool_request.filename, tool_request.filename,
-                    tool_request.line, tool_request.character,
-                    rename_new_name);
-                return .RENAME;
+            loc_ok, filename, line, col := parse_location(args[i], cwd);
+            if !loc_ok {
+                log_error("Invalid location. Usage: <file>@<line>:<col>");
+                return options, false;
             }
 
-            log_error("Incomplete rename arguments. Usage: -rename <file>@<line>:<col> <new_name> [-y]");
-            return .NONE;
+            options.mode = .FIND_USAGES;
+            options.request = .{ filename = filename, line = line, column = col };
+        } else if arg == "-rename" {
+            i += 1;
+            if i >= args.count {
+                log_error("Incomplete rename arguments. Usage: -rename <file>@<line>:<col> <new_name> [-y]");
+                return options, false;
+            }
+
+            loc_ok, filename, line, col := parse_location(args[i], cwd);
+            if !loc_ok {
+                log_error("Invalid location. Usage: <file>@<line>:<col>");
+                return options, false;
+            }
+
+            i += 1;
+            if i >= args.count {
+                log_error("Incomplete rename arguments. Usage: -rename <file>@<line>:<col> <new_name> [-y]");
+                return options, false;
+            }
+
+            options.mode = .RENAME;
+            options.request = .{ filename = filename, line = line, column = col };
+            options.new_name = args[i];
+        } else if arg == "-y" {
+            options.apply = true;
+        } else {
+            log_error("Unknown argument '%'", arg);
+            return options, false;
         }
 
         i += 1;
     }
 
-    return .NONE;
+    if options.mode == .NONE {
+        print_usage();
+        return options, false;
+    }
+
+    return options, true;
 }
 
-programming_handle_message :: (message: *Message) {
-    if active_tool == .NONE  return;
+programming_run :: (args: [] string) -> bool {
+    cwd := get_working_directory();
+    options, args_ok := programming_parse_args(args, cwd);
+    if !args_ok return false;
 
-    if message.kind == {
-        case .TYPECHECKED;
-            tc := cast(*Message_Typechecked) message;
+    files, inputs, project_ok := load_project(options);
+    if !project_ok return false;
 
-            for tc.all {
-                buffer_node(*all_references, it.expression);
-                for sub: it.subexpressions {
-                    buffer_node(*all_references, sub);
-                }
-
-                if it.expression != null && it.expression.kind == .PROCEDURE_BODY {
-                    body := cast(*Code_Procedure_Body) it.expression;
-                    if body.block {
-                        buffer_block_recursive(*all_blocks, body.block);
-                        buffer_statements_recursive(*all_references, body.block);
-                    }
-                }
-            }
-
-            for tc.procedure_headers {
-                header := it.expression;
-                for header.arguments  buffer_node(*all_references, cast(*Code_Node) it);
-                for header.returns    buffer_node(*all_references, cast(*Code_Node) it);
-            }
-
-            for tc.structs {
-                s := it.expression;
-                if s.block {
-                    buffer_block(*all_blocks, s.block);
-                    for s.block.members    buffer_node(*all_references, it);
-                    for s.block.statements buffer_node(*all_references, it);
-                }
-                if s.arguments_block {
-                    buffer_block(*all_blocks, s.arguments_block);
-                    for s.arguments_block.members  buffer_node(*all_references, it);
-                }
-                if s.constants_block {
-                    buffer_block(*all_blocks, s.constants_block);
-                    for s.constants_block.members  buffer_node(*all_references, it);
-                }
-            }
-
-            for tc.procedure_bodies {
-                body := it.expression;
-                if body.block {
-                    buffer_block_recursive(*all_blocks, body.block);
-                    buffer_statements_recursive(*all_references, body.block);
-                }
-            }
+    if options.mode == .FIND_DEF {
+        resolver := resolve_project_symbols_for_file(inputs, options.request.filename);
+        return run_find_def(files, resolver, options);
     }
-}
 
-programming_finish :: () {
-    if active_tool == {
-        case .FIND_DEF;     finish_find_def();
-        case .FIND_USAGES;  finish_find_usages();
-        case .RENAME;       finish_rename();
+    resolver := resolve_project_symbols(inputs);
+
+    if options.mode == {
+        case .FIND_USAGES; return run_find_usages(files, resolver, options);
+        case .RENAME; return run_rename(files, resolver, options);
+        case .NONE;
+        case .FIND_DEF;
     }
+
+    return false;
 }
