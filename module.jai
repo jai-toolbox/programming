@@ -413,6 +413,27 @@ print_usages :: (files: [] Programming_File, resolver: Resolver_Result, symbol: 
     }
 }
 
+file_list_contains_path :: (files: [] Programming_File, path: string) -> bool {
+    for file: files {
+        if path_equal(file.path, path) return true;
+    }
+    return false;
+}
+
+collect_rename_files :: (files: [] Programming_File, options: Program_Options) -> [..] Programming_File {
+    result: [..] Programming_File;
+    project_directory := resolve_path(options.directory, get_working_directory());
+    modules_directory := resolve_path(options.jai_modules_directory, get_working_directory());
+
+    for file: files {
+        if !path_is_under_directory(file.path, project_directory) continue;
+        if options.include_jai_modules && path_is_under_directory(file.path, modules_directory) continue;
+        array_add(*result, file);
+    }
+
+    return result;
+}
+
 scope_is_or_descends_from :: (scope: *Resolver_Scope, ancestor: *Resolver_Scope) -> bool {
     current := scope;
     while current != null {
@@ -439,7 +460,7 @@ log_symbol_location :: (prefix: string, symbol: *Resolver_Symbol) {
     log("  % %@%:%", prefix, symbol.file_path, symbol.declaration_node.span.line, symbol.declaration_node.span.column);
 }
 
-check_rename_conflicts :: (resolver: Resolver_Result, symbol: *Resolver_Symbol, new_name: string) -> int {
+check_rename_conflicts :: (resolver: Resolver_Result, symbol: *Resolver_Symbol, new_name: string, rename_files: [] Programming_File) -> int {
     if symbol == null || new_name == symbol.name return 0;
 
     warnings := 0;
@@ -464,6 +485,7 @@ check_rename_conflicts :: (resolver: Resolver_Result, symbol: *Resolver_Symbol, 
 
     for reference: resolver.references {
         if reference.node == null || reference.scope == null continue;
+        if !file_list_contains_path(rename_files, reference.file_path) continue;
 
         if reference.symbol == symbol {
             visible_symbol := find_symbol(reference.scope, new_name);
@@ -556,8 +578,9 @@ run_rename :: (files: [] Programming_File, resolver: Resolver_Result, options: P
     log("  Declared at: %@%:%", symbol.file_path, symbol.declaration_node.span.line, symbol.declaration_node.span.column);
     log(" ");
 
-    print_usages(files, resolver, symbol);
-    warnings := check_rename_conflicts(resolver, symbol, options.new_name);
+    rename_files := collect_rename_files(files, options);
+    print_usages(rename_files, resolver, symbol);
+    warnings := check_rename_conflicts(resolver, symbol, options.new_name, rename_files);
 
     if !options.apply {
         if warnings > 0 {
@@ -574,7 +597,7 @@ run_rename :: (files: [] Programming_File, resolver: Resolver_Result, options: P
     }
 
     total_edits := 0;
-    for file: files {
+    for file: rename_files {
         edits := collect_edits_for_file(resolver, symbol, file.path);
         if edits.count == 0 continue;
 
