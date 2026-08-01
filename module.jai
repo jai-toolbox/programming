@@ -15,6 +15,7 @@ still visible to find-usages and rename.
 #import "File";
 #import "File_Utilities";
 #import "String";
+#import "tbx/file";
 #import "tbx/parser";
 
 #scope_module
@@ -53,94 +54,6 @@ Programming_File :: struct {
 Programming_Edit :: struct {
     start: int;
     count: int;
-}
-
-path_char_equal :: (a: u8, b: u8) -> bool {
-    if a >= #char "A" && a <= #char "Z" a += #char "a" - #char "A";
-    if b >= #char "A" && b <= #char "Z" b += #char "a" - #char "A";
-    if a == b return true;
-    if (a == #char "/" || a == #char "\\") && (b == #char "/" || b == #char "\\") return true;
-    return false;
-}
-
-path_equal :: (a: string, b: string) -> bool {
-    if a.count == b.count {
-        for i: 0..a.count-1 {
-            if !path_char_equal(a[i], b[i]) return false;
-        }
-        return true;
-    }
-
-    longer := a;
-    shorter := b;
-    if b.count > a.count {
-        longer = b;
-        shorter = a;
-    }
-
-    start := longer.count - shorter.count;
-    if start > 0 && !path_char_equal(longer[start - 1], #char "/") return false;
-
-    for i: 0..shorter.count-1 {
-        if !path_char_equal(longer[start + i], shorter[i]) return false;
-    }
-
-    return true;
-}
-
-path_is_under_directory :: (path: string, directory: string) -> bool {
-    if path_equal(path, directory) return true;
-    if path.count <= directory.count return false;
-
-    for i: 0..directory.count-1 {
-        if !path_char_equal(path[i], directory[i]) return false;
-    }
-
-    return path_char_equal(path[directory.count], #char "/");
-}
-
-resolve_path :: (path: string, cwd: string) -> string {
-    if path.count == 0 return path;
-
-    raw := path;
-    if raw.count >= 2 && raw[0] == #char "." && (raw[1] == #char "/" || raw[1] == #char "\\") {
-        raw = slice(raw, 2, raw.count - 2);
-    }
-
-    result: string;
-    if raw.count >= 3 && raw[0] == #char "/" && raw[2] == #char "/" &&
-       ((raw[1] >= #char "a" && raw[1] <= #char "z") || (raw[1] >= #char "A" && raw[1] <= #char "Z")) {
-        result = tprint("%", raw);
-        result[0] = raw[1];
-        if result[0] >= #char "a" && result[0] <= #char "z" result[0] -= #char "a" - #char "A";
-        result[1] = #char ":";
-    } else if raw.count >= 2 && raw[1] == #char ":" {
-        result = tprint("%", raw);
-    } else if raw[0] == #char "/" || raw[0] == #char "\\" {
-        result = tprint("%", raw);
-    } else {
-        result = tprint("%/%", cwd, raw);
-    }
-
-    for i: 0..result.count-1 {
-        if result[i] == #char "\\" result[i] = #char "/";
-    }
-
-    cleaned: String_Builder;
-    i := 0;
-    while i < result.count {
-        if result[i] == #char "/" && i + 2 < result.count && result[i + 1] == #char "." && result[i + 2] == #char "/" {
-            append(*cleaned, "/");
-            i += 3;
-            continue;
-        }
-
-        append(*cleaned, result[i]);
-        i += 1;
-    }
-
-    result = builder_to_string(*cleaned);
-    return result;
 }
 
 find_last :: (s: string, c: u8) -> int {
